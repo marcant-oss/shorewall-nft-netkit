@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shorewall-nft-netkit"
-version = "1.8.0"
+version = "1.9.0"
 description = "Low-level netns / TUN-TAP / packet-construction primitives for shorewall-nft tools"
 readme = "README.md"
 requires-python = ">=3.11"
