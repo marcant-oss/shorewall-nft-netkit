@@ -32,6 +32,8 @@ import ctypes
 import ctypes.util
 import os
 import signal
+import subprocess
+import time
 from typing import Any
 
 # Linux syscalls + constants
@@ -48,25 +50,47 @@ def _libc_check(name: str, rc: int) -> None:
         raise OSError(err, f"{name} failed: {os.strerror(err)}")
 
 
+def _stub_log_failure(pid: int, step: str, exc: BaseException) -> None:  # pragma: no cover
+    """Write a failure marker to /tmp so operators can diagnose silent child exits."""
+    try:
+        with open(f"/tmp/simlab-stub-setup.{pid}", "a") as f:
+            f.write(f"FAILED step={step!r} exc={exc!r}\n")
+    except OSError:
+        pass
+
+
 def _stub_main(name: str, read_fd: int, write_fd: int) -> None:  # pragma: no cover
     """Body of the forked child."""
+    pid = os.getpid()
     # Die automatically if parent dies — gives SIGTERM first for cleanup.
     _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
 
     # Step 1: unshare our net namespace.
-    _libc_check("unshare(CLONE_NEWNET)", _libc.unshare(_CLONE_NEWNET))
+    try:
+        _libc_check("unshare(CLONE_NEWNET)", _libc.unshare(_CLONE_NEWNET))
+    except OSError as exc:
+        _stub_log_failure(pid, "unshare(CLONE_NEWNET)", exc)
+        os._exit(1)
 
     # Step 2: bind-mount /proc/self/ns/net → /run/netns/<name>
     os.makedirs("/run/netns", exist_ok=True)
     target = f"/run/netns/{name}"
     # Create the target file if missing (bind mount onto an empty file)
-    fd = os.open(target, os.O_CREAT | os.O_WRONLY, 0o644)
-    os.close(fd)
-    _libc_check(
-        "mount(bind)",
-        _libc.mount(b"/proc/self/ns/net", target.encode(),
-                    b"none", _MS_BIND, None),
-    )
+    try:
+        fd = os.open(target, os.O_CREAT | os.O_WRONLY, 0o644)
+        os.close(fd)
+    except OSError as exc:
+        _stub_log_failure(pid, f"open/create {target!r}", exc)
+        os._exit(1)
+    try:
+        _libc_check(
+            "mount(bind)",
+            _libc.mount(b"/proc/self/ns/net", target.encode(),
+                        b"none", _MS_BIND, None),
+        )
+    except OSError as exc:
+        _stub_log_failure(pid, f"mount(bind) -> {target!r}", exc)
+        os._exit(1)
 
     def cleanup(signum: int = 0, frame: Any = None) -> None:
         # Best-effort umount + unlink + exit. Writes a marker file so
@@ -119,6 +143,30 @@ def _stub_main(name: str, read_fd: int, write_fd: int) -> None:  # pragma: no co
     cleanup()
 
 
+def _cleanup_orphan_netns(name: str) -> None:
+    """Remove a stale /run/netns/<name> bind-mount left by a previous crash.
+
+    Called before fork() so the child always gets a clean target path.
+    Errors are silently swallowed — this is best-effort pre-cleanup.
+    """
+    target = f"/run/netns/{name}"
+    if os.path.exists(target):
+        # Try umount first — the file may be a live bind-mount from a dead netns.
+        subprocess.run(
+            ["umount", target],
+            check=False, capture_output=True,
+        )
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+    # Belt-and-braces: unregister from iproute2's netns list if it was registered.
+    subprocess.run(
+        ["ip", "netns", "del", name],
+        check=False, capture_output=True,
+    )
+
+
 def spawn_nsstub(name: str) -> int:
     """Fork a stub process pinning a new netns named ``name``.
 
@@ -131,7 +179,15 @@ def spawn_nsstub(name: str) -> int:
     ``spawn_nsstub.<name>_fd`` before expecting the stub to exit —
     but for simplicity we attach the fd to the process group via
     a module-level dict.
+
+    Idempotency: if a stale /run/netns/<name> bind-mount is found
+    (left by a previous SIGKILL'd run), it is umounted and removed
+    before the child forks, so the bind-mount in _stub_main always
+    succeeds.
     """
+    # Pre-fork: remove any orphaned bind-mount from a previous crash.
+    _cleanup_orphan_netns(name)
+
     # Keep-alive pipe: parent holds the write end; stub holds read.
     ka_r, ka_w = os.pipe()
     # Readiness pipe: stub writes 'R' when done setup; parent reads.
@@ -154,9 +210,12 @@ def spawn_nsstub(name: str) -> int:
     try:
         buf = os.read(ready_r, 1)
         if buf != b"R":
+            # Child exited without writing 'R'. Try to collect its exit status
+            # so the error message is actionable.
+            exit_detail = _collect_child_exit(pid)
             raise RuntimeError(
                 f"nsstub for {name!r} didn't signal readiness "
-                f"(got {buf!r})"
+                f"(got {buf!r}; child {exit_detail})"
             )
     finally:
         os.close(ready_r)
@@ -164,6 +223,29 @@ def spawn_nsstub(name: str) -> int:
     # Stash the write-end fd so the caller can close it on shutdown.
     _keepalive_fds[(name, pid)] = ka_w
     return pid
+
+
+def _collect_child_exit(pid: int, *, wait_ms: int = 500) -> str:
+    """Wait up to ``wait_ms`` milliseconds for ``pid`` to exit, then return
+    a human-readable description of how it exited.
+
+    Returns a string like ``"exited code 1"`` or ``"exited with signal 11"``
+    or ``"still running after 500 ms"`` so callers can embed it in error messages.
+    """
+    deadline = time.monotonic() + wait_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return "already reaped"
+        if wpid == pid:
+            if os.WIFSIGNALED(status):
+                return f"exited with signal {os.WTERMSIG(status)}"
+            if os.WIFEXITED(status):
+                return f"exited code {os.WEXITSTATUS(status)}"
+            return f"exited (raw status {status:#x})"
+        time.sleep(0.02)
+    return f"still running after {wait_ms} ms"
 
 
 def stop_nsstub(name: str, pid: int, *, timeout: float = 2.0) -> None:
@@ -175,7 +257,6 @@ def stop_nsstub(name: str, pid: int, *, timeout: float = 2.0) -> None:
         except OSError:
             pass
     # Best-effort waitpid
-    import time
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         try:
