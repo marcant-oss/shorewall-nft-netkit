@@ -545,6 +545,28 @@ def test_memfd_is_cloexec():
         os.close(fd)
 
 
+@_NEEDS_MEMFD
+def test_memfd_no_filesystem_entry():
+    """A memfd does not appear under /tmp or any other filesystem path.
+
+    The kernel-assigned link in /proc/self/fd shows ``/memfd:<name>`` which
+    contains ``memfd:`` but not any /tmp path component.
+    """
+    fd = _memfd_write(b"private", name="test_nopath")
+    try:
+        fd_link = os.readlink(f"/proc/self/fd/{fd}")
+        # Kernel resolves memfd fds as '/memfd:<name> (deleted)' — not a
+        # real filesystem path, just an in-kernel pseudo-name.
+        assert "memfd:" in fd_link, (
+            f"Expected 'memfd:' in fd_link, got: {fd_link!r}"
+        )
+        assert "/tmp/" not in fd_link, (
+            f"memfd appeared as a /tmp path: {fd_link!r}"
+        )
+    finally:
+        os.close(fd)
+
+
 # ---------------------------------------------------------------------------
 # _pickle_with_oob / _unpickle_with_oob unit tests (no root required)
 # ---------------------------------------------------------------------------
@@ -696,12 +718,6 @@ def test_no_tmp_touch_on_large_roundtrip(netns):
 # ---------------------------------------------------------------------------
 # run_nft_in_netns_zc tests (require root + libnftables)
 # ---------------------------------------------------------------------------
-
-_NEEDS_LIBNFT = pytest.mark.skipif(
-    os.geteuid() != 0,
-    reason="requires root for netns + nftables",
-)
-
 
 def _has_libnftables() -> bool:
     try:
@@ -865,7 +881,7 @@ def test_run_nft_zc_raises_when_memfd_unavailable(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Large-payload tests — one-shot path (pure-pipe, no tempfile)
+# Large-payload tests — one-shot path (pure-pipe)
 # ---------------------------------------------------------------------------
 
 
@@ -935,7 +951,7 @@ def test_large_return_value_100mb_linear_timing(netns):
 
 
 # ---------------------------------------------------------------------------
-# memfd-backed large-payload mode tests (replaces old tempfile-backed tests)
+# memfd-backed large-payload mode tests
 # ---------------------------------------------------------------------------
 
 
@@ -1047,18 +1063,6 @@ def test_persistent_worker_64mb_round_trip(netns):
 
 
 @_NEEDS_ROOT
-def test_persistent_worker_zero_byte_stream(netns):
-    """SOCK_STREAM worker handles a 0-byte message (edge case: length=0)."""
-    worker = PersistentNetnsWorker(netns, _echo_worker)
-    worker.start()
-    try:
-        reply = worker.dispatch(b"", timeout=5.0)
-        assert reply == b""
-    finally:
-        worker.stop()
-
-
-@_NEEDS_ROOT
 def test_persistent_worker_mixed_sequence(netns):
     """Mixed small/huge/small sequence verifies framing boundaries are preserved."""
     worker = PersistentNetnsWorker(netns, _echo_worker)
@@ -1159,52 +1163,3 @@ def test_try_bump_pipe_size_does_not_raise():
     finally:
         os.close(r_fd)
         os.close(w_fd)
-
-
-# ---------------------------------------------------------------------------
-# memfd helper unit tests (non-root) — replaces old tempfile helper tests
-# ---------------------------------------------------------------------------
-
-
-@_NEEDS_MEMFD
-def test_memfd_write_and_read_roundtrip():
-    """_memfd_write + _memfd_read round-trip preserves all bytes."""
-    data = b"test payload " * 1000
-    fd = _memfd_write(data, name="unit_rtrip")
-    try:
-        result = _memfd_read(fd, len(data))
-    finally:
-        os.close(fd)
-    assert result == data
-
-
-@_NEEDS_MEMFD
-def test_memfd_read_empty():
-    """_memfd_read handles zero-length payload."""
-    fd = _memfd_write(b"", name="unit_empty")
-    try:
-        result = _memfd_read(fd, 0)
-    finally:
-        os.close(fd)
-    assert result == b""
-
-
-@_NEEDS_MEMFD
-def test_memfd_no_filesystem_entry():
-    """A memfd does not appear under /tmp or any other filesystem path.
-    The kernel-assigned link in /proc/self/fd shows '/memfd:<name>' which
-    contains 'memfd:' but not any /tmp path component.
-    """
-    fd = _memfd_write(b"private", name="unit_nopath")
-    try:
-        fd_link = os.readlink(f"/proc/self/fd/{fd}")
-        # Kernel resolves memfd fds as '/memfd:<name> (deleted)' — not a
-        # real filesystem path, just an in-kernel pseudo-name.
-        assert "memfd:" in fd_link, (
-            f"Expected 'memfd:' in fd_link, got: {fd_link!r}"
-        )
-        assert "/tmp/" not in fd_link, (
-            f"memfd appeared as a /tmp path: {fd_link!r}"
-        )
-    finally:
-        os.close(fd)

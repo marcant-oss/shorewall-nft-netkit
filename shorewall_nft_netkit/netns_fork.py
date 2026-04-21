@@ -1434,11 +1434,10 @@ class PersistentNetnsWorker:
     ``SOCK_STREAM`` has no per-datagram size cap; arbitrary-size messages
     are handled transparently.  A 0-length payload is valid (empty message).
 
-    Previously this class used ``SOCK_SEQPACKET``.  It was switched to
-    ``SOCK_STREAM`` because ``SOCK_SEQPACKET`` has a per-datagram size cap
-    (effectively bounded by the socket send buffer, typically 200 KiB–1 MiB)
-    that causes ``EMSGSIZE`` or silent truncation on large payloads such as
-    nft set dumps with millions of entries.  ``SOCK_STREAM`` has no such cap.
+    Rationale for ``SOCK_STREAM``: datagram-oriented socket types impose a
+    per-message cap (bounded by the socket send buffer, typically
+    200 KiB–1 MiB) that causes ``EMSGSIZE`` on large nft set dumps.
+    ``SOCK_STREAM`` with length-prefix framing has no such cap.
     """
 
     def __init__(
