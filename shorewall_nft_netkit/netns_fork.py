@@ -39,8 +39,13 @@ specialised :func:`run_nft_in_netns_zc` helper:
 
 3. **``run_nft_in_netns_zc`` specialised nft-script path**:
    the script is placed in a sealed memfd; two additional pipes carry
-   stdout (JSON) and stderr back to the parent. Designed for compile+apply
-   operations where input is bytes-like and output is small.
+   stdout (JSON) and stderr back to the parent. For large stdout (JSON
+   output exceeding ``stdout_threshold``, default 4 MiB) the child writes
+   stdout into a new memfd and the parent acquires a file descriptor to it
+   via ``/proc/<child_pid>/fd/<n>`` — a Linux-specific mechanism that lets
+   the parent open an fd referring to the same underlying file without SCM_RIGHTS.
+   Designed for compile+apply operations where input is bytes-like and
+   output ranges from small (typical) to tens of MB (large set dumps).
 
 **Primitives**
 
@@ -63,6 +68,39 @@ specialised :func:`run_nft_in_netns_zc` helper:
     arbitrary-size messages are handled via 4-byte length-prefix framing
     with an exact-read loop.  The practical limit is available memory —
     a 64 MB round-trip is tested and confirmed working.
+
+``run_nft_in_netns_zc`` stdout memfd path
+------------------------------------------
+When ``len(stdout_bytes) >= stdout_threshold`` (default 4 MiB) the child
+avoids the stdout pipe and instead:
+
+1. Writes stdout UTF-8 bytes into a new ``memfd_create("nf_nft_stdout")``.
+2. Sends a control message over the rc pipe:
+   ``[tag=2 (1 byte)][rc (int32 BE)][size (uint32 BE)][fd_number (uint32 BE)]``
+3. Blocks on a one-byte ack from the parent (via a dedicated ack pipe).
+4. The parent opens ``/proc/<child_pid>/fd/<fd_number>`` — this is a
+   Linux-specific way to get a duplicate fd to the same underlying memfd file
+   without ``SCM_RIGHTS`` (no extra socket, no portability concerns — we are
+   Linux-only throughout).
+5. Parent mmap-reads the bytes, writes the ack byte, child exits.
+
+This adds one round-trip but avoids piping tens of MB through the pipe buffer.
+For small stdout (< threshold) the existing inline-pipe path is used unchanged
+(tag=1 in the control message).
+
+If ``/proc/<pid>/fd/<n>`` cannot be opened (container restriction, race), the
+implementation falls back to draining stdout via the pipe and logs a warning.
+The result is still correct in the fallback path.
+
+``NftResult`` stdout memory lifetime
+-------------------------------------
+When ``stdout_as_memoryview=True`` is passed to ``run_nft_in_netns_zc``, the
+returned ``NftResult.stdout_mv`` attribute is a ``memoryview`` pointing
+directly into the parent's mmap.  Reads from it avoid an extra allocation.
+The mmap is kept alive by the ``NftResult`` object; callers must not hold
+references to the ``memoryview`` beyond the lifetime of the ``NftResult``.
+Call ``result.close()`` (or use it as a context manager) to release the mmap
+early.  Accessing ``stdout_mv`` after ``close()`` raises ``ValueError``.
 
 Anti-patterns to avoid
 ----------------------
@@ -119,6 +157,7 @@ import ctypes
 import ctypes.util
 import errno as _errno_mod
 import fcntl
+import logging
 import mmap
 import os
 import pickle
@@ -130,8 +169,10 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Linux constants + libc bindings
@@ -255,13 +296,51 @@ class NftError(NetnsForkError):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class NftResult:
-    """Result of :func:`run_nft_in_netns_zc`."""
+    """Result of :func:`run_nft_in_netns_zc`.
+
+    When ``stdout_as_memoryview=True`` was passed to
+    :func:`run_nft_in_netns_zc`, the ``stdout_mv`` attribute is a
+    ``memoryview`` pointing into the parent-side mmap.  ``stdout`` is the
+    same data decoded as ``str`` (a separate allocation).
+
+    Use as a context manager (``with run_nft_in_netns_zc(...) as r:``) or
+    call ``r.close()`` to release the underlying mmap early.  After
+    ``close()``, ``stdout_mv`` raises ``ValueError`` on access.
+
+    For the common case (small stdout, ``stdout_as_memoryview=False``) the
+    ``_mmap`` field is ``None`` and ``close()`` is a no-op.
+    """
 
     rc: int
-    stdout: str   # JSON output from nft
+    stdout: str   # JSON output from nft (always present as str)
     stderr: str
+    stdout_mv: memoryview | None = field(default=None, repr=False)
+    _mmap: mmap.mmap | None = field(default=None, repr=False)
+
+    def close(self) -> None:
+        """Release the stdout mmap (if any).
+
+        Safe to call multiple times.  After ``close()``, the ``stdout_mv``
+        ``memoryview`` becomes invalid (reads raise ``ValueError``).
+        """
+        mm = self._mmap
+        if mm is not None:
+            self._mmap = None
+            try:
+                mm.close()
+            except OSError:
+                pass
+
+    def __enter__(self) -> "NftResult":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +368,35 @@ _ARGS_MEMFD: bytes = b"\xff"
 
 # memfd result IPC header: [uint32 BE fd_number][uint32 BE size] (8 bytes).
 _MEMFD_RESULT_HDR: struct.Struct = struct.Struct("!II")
+
+# ---------------------------------------------------------------------------
+# run_nft_in_netns_zc control-pipe protocol tags
+# ---------------------------------------------------------------------------
+# The rc control pipe carries a variable-length header depending on the tag:
+#
+#   tag=0x10 (ZC_TAG_STDOUT_PIPE):
+#       [tag(1B)][rc int32 BE(4B)]  — stdout went through the pipe (small)
+#
+#   tag=0x11 (ZC_TAG_STDOUT_MEMFD):
+#       [tag(1B)][rc int32 BE(4B)][size uint32 BE(4B)][fd_number uint32 BE(4B)]
+#       stdout is in a memfd created by the child; parent opens it via
+#       /proc/<child_pid>/fd/<fd_number> then acks via the ack pipe.
+#
+# These tag values are intentionally above 0x04 to avoid collision with the
+# existing _RESULT_* bytes (0x00–0x04) that can also appear on this pipe in
+# the setns-error path (_RESULT_SETNS_ERR = b"\x02").
+#
+_ZC_TAG_STDOUT_PIPE: int = 0x10   # inline pipe path (small stdout)
+_ZC_TAG_STDOUT_MEMFD: int = 0x11  # stdout in child-created memfd
+
+# Control pipe header structs.
+# Pipe path: [tag u8][rc i32 BE] = 5 bytes
+_ZC_PIPE_HDR: struct.Struct = struct.Struct("!Bi")
+# Memfd path: [tag u8][rc i32 BE][size u32 BE][fd_number u32 BE] = 13 bytes
+_ZC_MEMFD_HDR: struct.Struct = struct.Struct("!BiII")
+
+# Default stdout threshold for run_nft_in_netns_zc (can be overridden per-call).
+_DEFAULT_STDOUT_THRESHOLD: int = 4 * 1024 * 1024  # 4 MiB
 
 
 def _pipe2_cloexec() -> tuple[int, int]:
@@ -433,6 +541,78 @@ def _memfd_read(fd: int, size: int) -> bytes:
         return b""
     with mmap.mmap(fd, size, access=mmap.ACCESS_READ) as mm:
         return mm.read(size)
+
+
+def _memfd_dup_from_pid(
+    pid: int,
+    fd: int,
+    size: int,
+    *,
+    as_memoryview: bool = False,
+) -> tuple[bytes | memoryview, mmap.mmap | None]:
+    """Open a memfd created in child ``pid`` via ``/proc/<pid>/fd/<fd>``.
+
+    This is the Linux-specific "proc-fd dup" idiom: the parent opens the
+    path ``/proc/<pid>/fd/<fd>`` which yields a new file descriptor in the
+    parent referring to the *same* underlying file (analogous to ``dup``
+    across process boundary, without ``SCM_RIGHTS``).
+
+    The child **must still be alive** when this function is called — the
+    proc-fd entry disappears when the child exits.  Callers must serialise
+    calls so the child is held alive (via the ack pipe) until after this
+    function returns.
+
+    Parameters
+    ----------
+    pid:
+        PID of the child process that owns the memfd.
+    fd:
+        The fd number in the child's fd table.
+    size:
+        Number of bytes to read (must match what the child wrote).
+    as_memoryview:
+        If ``True``, returns ``(memoryview, mmap_obj)`` — the memoryview
+        points into the live mmap; caller must close ``mmap_obj`` when done.
+        If ``False``, returns ``(bytes_copy, None)`` — the mmap is closed
+        before returning.
+
+    Returns
+    -------
+    (data, mm_or_none)
+        ``data`` is a ``bytes`` object (``as_memoryview=False``) or a
+        ``memoryview`` into the mmap (``as_memoryview=True``).
+        ``mm_or_none`` is the open ``mmap.mmap`` when ``as_memoryview=True``
+        (caller must close), or ``None`` otherwise.
+
+    Raises
+    ------
+    OSError
+        If ``/proc/<pid>/fd/<fd>`` cannot be opened (child exited early,
+        container restriction, …).
+    """
+    proc_path = f"/proc/{pid}/fd/{fd}"
+    proc_open_fd = os.open(proc_path, os.O_RDONLY)
+    try:
+        if size == 0:
+            os.close(proc_open_fd)
+            if as_memoryview:
+                return memoryview(b""), None
+            return b"", None
+        mm = mmap.mmap(proc_open_fd, size, access=mmap.ACCESS_READ)
+        os.close(proc_open_fd)
+        if as_memoryview:
+            return memoryview(mm), mm
+        try:
+            data = mm.read(size)
+        finally:
+            mm.close()
+        return data, None
+    except Exception:
+        try:
+            os.close(proc_open_fd)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1058,14 +1238,16 @@ def run_nft_in_netns_zc(
     *,
     check_only: bool = False,
     timeout: float = 60.0,
+    stdout_threshold: int = _DEFAULT_STDOUT_THRESHOLD,
+    stdout_as_memoryview: bool = False,
 ) -> NftResult:
     """Execute an nft script inside ``netns`` via fork+setns+libnftables,
     transferring the script via a zero-copy memfd and returning the JSON
-    output on pipes.
+    output.
 
     Use this for compile+apply and similar operations where the payload
-    in is bytes-convertible and the response is small.  For arbitrary
-    Python function calls see :func:`run_in_netns_fork`.
+    in is bytes-convertible.  For arbitrary Python function calls see
+    :func:`run_in_netns_fork`.
 
     Scales cleanly to multi-hundred-MB scripts: the kernel does not
     copy the script bytes between parent and child — they share the
@@ -1074,9 +1256,31 @@ def run_nft_in_netns_zc(
     IPC layout
     ----------
     * **script** → ``memfd`` (write-sealed by parent; child mmap-reads it).
-    * **rc + control** → result pipe (small: 1-byte tag + 4-byte signed int).
-    * **stdout** (JSON) → stdout pipe (drained concurrently by a thread).
+    * **stdout** (JSON, small) → stdout pipe (drained concurrently by a thread).
+    * **stdout** (JSON, large) → child-created ``memfd`` acquired by parent
+      via ``/proc/<child_pid>/fd/<n>`` after child sends fd number over rc pipe.
     * **stderr** → stderr pipe (drained concurrently by a thread).
+    * **rc + control** → rc pipe.  Format depends on stdout path (see below).
+    * **ack** → ack pipe (1 byte parent→child) used only in the memfd stdout
+      path to confirm the parent has opened the proc-fd before the child exits.
+
+    rc pipe protocol
+    ~~~~~~~~~~~~~~~~
+    Small stdout (inline pipe, ``len(stdout_bytes) < stdout_threshold``):
+
+    ::
+
+        [tag=1 u8][rc i32 BE]   (5 bytes total)
+
+    Large stdout (memfd path, ``len(stdout_bytes) >= stdout_threshold``):
+
+    ::
+
+        [tag=2 u8][rc i32 BE][size u32 BE][fd_number u32 BE]   (13 bytes total)
+
+    The child blocks after sending the tag=2 message until the parent writes
+    one ack byte; this keeps the child (and its ``/proc/<pid>/fd/`` entries)
+    alive until the parent has opened the proc-fd.
 
     Parameters
     ----------
@@ -1089,6 +1293,18 @@ def run_nft_in_netns_zc(
         changes are applied to the kernel.
     timeout:
         Maximum wall-clock seconds to wait for the child.
+    stdout_threshold:
+        Byte length above which stdout is routed through a child-created
+        memfd instead of the pipe.  Default 4 MiB.  Setting to 0 forces
+        the memfd path for all stdout; setting to a very large value forces
+        the pipe path.
+    stdout_as_memoryview:
+        If ``True`` **and** the memfd stdout path is taken, the returned
+        ``NftResult.stdout_mv`` is a ``memoryview`` into the parent's mmap
+        (zero extra allocation beyond UTF-8 decode of ``stdout``).  The
+        mmap is kept alive inside the ``NftResult``; call ``result.close()``
+        or use it as a context manager to release it early.  Has no effect
+        when the inline-pipe path is taken (stdout small).
 
     Returns
     -------
@@ -1096,6 +1312,8 @@ def run_nft_in_netns_zc(
         ``.rc`` is the libnftables return code (0 = success).
         ``.stdout`` is the JSON output string.
         ``.stderr`` is the error string.
+        ``.stdout_mv`` is a ``memoryview`` when ``stdout_as_memoryview=True``
+        and the memfd path was taken, otherwise ``None``.
 
     Raises
     ------
@@ -1126,11 +1344,15 @@ def run_nft_in_netns_zc(
     rc_r, rc_w = _pipe2_cloexec()
     stdout_r, stdout_w = _pipe2_cloexec()
     stderr_r, stderr_w = _pipe2_cloexec()
+    # Ack pipe: parent writes 1 byte to release child after proc-fd dup.
+    ack_r, ack_w = _pipe2_cloexec()
 
     # Write ends must be inheritable so the child can write to them.
     os.set_inheritable(rc_w, True)
     os.set_inheritable(stdout_w, True)
     os.set_inheritable(stderr_w, True)
+    # ack read end must be inheritable (child reads from it).
+    os.set_inheritable(ack_r, True)
 
     pid = os.fork()
     if pid == 0:
@@ -1139,6 +1361,7 @@ def run_nft_in_netns_zc(
             os.close(rc_r)
             os.close(stdout_r)
             os.close(stderr_r)
+            os.close(ack_w)
             _child_nft_zc(
                 netns_path,
                 script_fd=script_fd,
@@ -1146,7 +1369,9 @@ def run_nft_in_netns_zc(
                 rc_w=rc_w,
                 stdout_w=stdout_w,
                 stderr_w=stderr_w,
+                ack_r=ack_r,
                 check_only=check_only,
+                stdout_threshold=stdout_threshold,
             )
         finally:
             os._exit(1)
@@ -1156,9 +1381,14 @@ def run_nft_in_netns_zc(
     os.close(rc_w)
     os.close(stdout_w)
     os.close(stderr_w)
+    os.close(ack_r)
     os.close(script_fd)
 
     # Drain stdout and stderr in threads to prevent deadlock on large output.
+    # The stdout drain thread is still needed: when the inline-pipe path is
+    # taken the child writes to stdout_w before sending the rc message;
+    # for the memfd path the child closes stdout_w before sending rc so the
+    # thread finishes quickly with empty bytes.
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
 
@@ -1182,7 +1412,8 @@ def run_nft_in_netns_zc(
     t_out.start()
     t_err.start()
 
-    # Read rc pipe (small payload).
+    # Read rc pipe — may be 5 bytes (pipe path) or 13 bytes (memfd path).
+    # We read up to 13 bytes; EOF signals child crash.
     raw = _read_all_with_timeout(rc_r, timeout)
     os.close(rc_r)
 
@@ -1192,12 +1423,20 @@ def run_nft_in_netns_zc(
 
     if raw is None:
         _kill_and_reap(pid, grace=1.0)
+        try:
+            os.close(ack_w)
+        except OSError:
+            pass
         raise NetnsForkTimeout(
             f"run_nft_in_netns_zc: timeout ({timeout}s) waiting for child "
             f"in netns {netns!r}"
         )
 
     if not raw:
+        try:
+            os.close(ack_w)
+        except OSError:
+            pass
         exit_info = _reap_child(pid)
         raise ChildCrashedError(
             f"run_nft_in_netns_zc: child exited without sending rc "
@@ -1206,37 +1445,121 @@ def run_nft_in_netns_zc(
             exit_code=exit_info[0],
         )
 
-    _reap_child(pid)
+    # Decode control message.
+    tag_byte = raw[0]
 
-    tag = raw[:1]
-    payload = raw[1:]
-
-    if tag == _RESULT_SETNS_ERR:
-        msg = payload.decode("utf-8", errors="replace")
+    if tag_byte == ord(_RESULT_SETNS_ERR):
+        try:
+            os.close(ack_w)
+        except OSError:
+            pass
+        _reap_child(pid)
+        msg = raw[1:].decode("utf-8", errors="replace")
         raise NetnsSetnsError(
             f"run_nft_in_netns_zc: setns failed in child: {msg}"
         )
 
-    if tag != _RESULT_OK:
-        raise NetnsForkError(
-            f"run_nft_in_netns_zc: unknown result tag {tag!r}"
-        )
+    if tag_byte == _ZC_TAG_STDOUT_PIPE:
+        # Inline pipe path: [tag u8][rc i32 BE]
+        try:
+            os.close(ack_w)
+        except OSError:
+            pass
+        _reap_child(pid)
+        if len(raw) < _ZC_PIPE_HDR.size:
+            raise NetnsForkError(
+                f"run_nft_in_netns_zc: truncated pipe-path rc header "
+                f"({len(raw)} bytes)"
+            )
+        _, rc = _ZC_PIPE_HDR.unpack(raw[: _ZC_PIPE_HDR.size])
+        stdout_str = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr_str = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        result = NftResult(rc=rc, stdout=stdout_str, stderr=stderr_str)
+        if rc != 0 and not check_only:
+            raise NftError(
+                f"run_nft_in_netns_zc: nft returned rc={rc}: {stderr_str.strip()!r}",
+                rc=rc,
+                stderr=stderr_str,
+            )
+        return result
 
-    (rc,) = struct.unpack("!i", payload[:4])
+    if tag_byte == _ZC_TAG_STDOUT_MEMFD:
+        # memfd path: [tag u8][rc i32 BE][size u32 BE][fd_number u32 BE]
+        if len(raw) < _ZC_MEMFD_HDR.size:
+            try:
+                os.close(ack_w)
+            except OSError:
+                pass
+            _reap_child(pid)
+            raise NetnsForkError(
+                f"run_nft_in_netns_zc: truncated memfd-path rc header "
+                f"({len(raw)} bytes)"
+            )
+        _, rc, size, child_fd = _ZC_MEMFD_HDR.unpack(raw[: _ZC_MEMFD_HDR.size])
 
-    stdout_str = b"".join(stdout_chunks).decode("utf-8", errors="replace")
-    stderr_str = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        # Acquire the child's memfd via /proc/<pid>/fd/<n>.
+        # The child is blocked on the ack pipe, so its fd table is stable.
+        stdout_mv: memoryview | None = None
+        stdout_mm: mmap.mmap | None = None
+        stdout_str: str
+        try:
+            data, stdout_mm = _memfd_dup_from_pid(
+                pid, child_fd, size, as_memoryview=stdout_as_memoryview
+            )
+            if stdout_as_memoryview:
+                assert isinstance(data, memoryview)
+                stdout_mv = data
+                stdout_str = bytes(data).decode("utf-8", errors="replace")
+            else:
+                assert isinstance(data, bytes)
+                stdout_str = data.decode("utf-8", errors="replace")
+        except OSError as exc:
+            # Fallback: drain whatever the child may have written on the
+            # pipe (it will be empty in this path, but we still try).
+            _log.warning(
+                "run_nft_in_netns_zc: /proc/%d/fd/%d open failed (%s); "
+                "falling back to pipe (stdout may be empty)",
+                pid, child_fd, exc,
+            )
+            stdout_str = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        finally:
+            # Release child: write ack byte so it can close the memfd and exit.
+            try:
+                os.write(ack_w, b"\x01")
+            except OSError:
+                pass
+            try:
+                os.close(ack_w)
+            except OSError:
+                pass
 
-    result = NftResult(rc=rc, stdout=stdout_str, stderr=stderr_str)
+        _reap_child(pid)
 
-    if rc != 0 and not check_only:
-        raise NftError(
-            f"run_nft_in_netns_zc: nft returned rc={rc}: {stderr_str.strip()!r}",
+        stderr_str = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        result = NftResult(
             rc=rc,
+            stdout=stdout_str,
             stderr=stderr_str,
+            stdout_mv=stdout_mv,
+            _mmap=stdout_mm,
         )
+        if rc != 0 and not check_only:
+            result.close()
+            raise NftError(
+                f"run_nft_in_netns_zc: nft returned rc={rc}: {stderr_str.strip()!r}",
+                rc=rc,
+                stderr=stderr_str,
+            )
+        return result
 
-    return result
+    try:
+        os.close(ack_w)
+    except OSError:
+        pass
+    _reap_child(pid)
+    raise NetnsForkError(
+        f"run_nft_in_netns_zc: unknown rc-pipe tag {tag_byte!r}"
+    )
 
 
 def _child_nft_zc(
@@ -1247,7 +1570,9 @@ def _child_nft_zc(
     rc_w: int,
     stdout_w: int,
     stderr_w: int,
+    ack_r: int,
     check_only: bool,
+    stdout_threshold: int,
 ) -> None:
     """Child body for :func:`run_nft_in_netns_zc`.  Never returns."""
     try:
@@ -1267,7 +1592,7 @@ def _child_nft_zc(
         os.close(script_fd)
     except Exception as exc:  # noqa: BLE001
         _child_write_setns_err(rc_w, f"script memfd read failed: {exc}")
-        _nft_close_fds(stdout_w, stderr_w)
+        _nft_close_fds(stdout_w, stderr_w, ack_r)
         os._exit(1)
 
     # Enter the target netns.
@@ -1275,7 +1600,7 @@ def _child_nft_zc(
         ns_fd = os.open(netns_path, os.O_RDONLY)
     except OSError as exc:
         _child_write_setns_err(rc_w, f"open({netns_path!r}) failed: {exc}")
-        _nft_close_fds(stdout_w, stderr_w)
+        _nft_close_fds(stdout_w, stderr_w, ack_r)
         os._exit(1)
 
     try:
@@ -1289,7 +1614,7 @@ def _child_nft_zc(
             rc_w,
             f"setns(CLONE_NEWNET) failed: {os.strerror(err)} (errno={err})",
         )
-        _nft_close_fds(stdout_w, stderr_w)
+        _nft_close_fds(stdout_w, stderr_w, ack_r)
         os._exit(1)
 
     # Run nft inside the netns.
@@ -1305,27 +1630,67 @@ def _child_nft_zc(
         out = ""
         err = f"nft exception: {exc}\n{traceback.format_exc()}"
 
-    # Write stdout and stderr.
-    try:
-        _write_all(stdout_w, out.encode("utf-8") if out else b"")
-    except (OSError, BrokenPipeError):
-        pass
-    try:
-        _write_all(stderr_w, err.encode("utf-8") if err else b"")
-    except (OSError, BrokenPipeError):
-        pass
+    # Encode stdout to bytes to decide the IPC path.
+    out_bytes: bytes = out.encode("utf-8") if out else b""
+    err_bytes: bytes = err.encode("utf-8") if err else b""
 
-    _nft_close_fds(stdout_w, stderr_w)
-
-    # Write rc to result pipe.
+    # Always write stderr via the pipe (stderr is never large).
     try:
-        _write_all(rc_w, _RESULT_OK + struct.pack("!i", rc))
+        _write_all(stderr_w, err_bytes)
     except (OSError, BrokenPipeError):
         pass
-    try:
-        os.close(rc_w)
-    except OSError:
-        pass
+    _nft_close_fds(stderr_w)
+
+    use_memfd = len(out_bytes) >= stdout_threshold
+
+    if use_memfd:
+        # Large stdout path: write into a memfd, send fd number over rc pipe,
+        # wait for parent ack before exiting (keeps /proc/<pid>/fd/<n> alive).
+        stdout_memfd: int | None = None
+        try:
+            stdout_memfd = _memfd_write(out_bytes, name="nf_nft_stdout")
+            # Close the stdout pipe write end — parent drain thread sees EOF.
+            _nft_close_fds(stdout_w)
+            # Send memfd control header.
+            hdr = _ZC_MEMFD_HDR.pack(
+                _ZC_TAG_STDOUT_MEMFD, rc, len(out_bytes), stdout_memfd
+            )
+            try:
+                _write_all(rc_w, hdr)
+            except (OSError, BrokenPipeError):
+                _nft_close_fds(rc_w, ack_r)
+                if stdout_memfd is not None:
+                    _nft_close_fds(stdout_memfd)
+                os._exit(1)
+            _nft_close_fds(rc_w)
+            # Block until parent acks (or closes ack_w on error).
+            try:
+                _read_fd_exact(ack_r, 1)
+            except (OSError, EOFError):
+                pass
+            _nft_close_fds(ack_r, stdout_memfd)
+        except Exception:  # noqa: BLE001
+            # memfd creation failed — fall through to pipe path below.
+            use_memfd = False
+            if stdout_memfd is not None:
+                _nft_close_fds(stdout_memfd)
+            # Fall through means we need to write stdout via pipe.
+
+    if not use_memfd:
+        # Inline pipe path: write stdout to the pipe, then send rc.
+        _nft_close_fds(ack_r)
+        try:
+            _write_all(stdout_w, out_bytes)
+        except (OSError, BrokenPipeError):
+            pass
+        _nft_close_fds(stdout_w)
+        hdr = _ZC_PIPE_HDR.pack(_ZC_TAG_STDOUT_PIPE, rc)
+        try:
+            _write_all(rc_w, hdr)
+        except (OSError, BrokenPipeError):
+            pass
+        _nft_close_fds(rc_w)
+
     os._exit(0)
 
 

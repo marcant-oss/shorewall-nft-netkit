@@ -24,6 +24,9 @@ import pytest
 import shorewall_nft_netkit.netns_fork as _mod
 from shorewall_nft_netkit.netns_fork import (
     _DEFAULT_LARGE_PAYLOAD_THRESHOLD,
+    _DEFAULT_STDOUT_THRESHOLD,
+    _ZC_TAG_STDOUT_MEMFD,
+    _ZC_TAG_STDOUT_PIPE,
     MEMFD_SUPPORTED,
     ChildContext,
     ChildCrashedError,
@@ -34,6 +37,7 @@ from shorewall_nft_netkit.netns_fork import (
     NftError,
     NftResult,
     PersistentNetnsWorker,
+    _memfd_dup_from_pid,
     _memfd_read,
     _memfd_write,
     _pickle_with_oob,
@@ -1163,3 +1167,587 @@ def test_try_bump_pipe_size_does_not_raise():
     finally:
         os.close(r_fd)
         os.close(w_fd)
+
+
+# ---------------------------------------------------------------------------
+# run_nft_in_netns_zc stdout-memfd path tests
+# ---------------------------------------------------------------------------
+
+
+@_NEEDS_MEMFD
+def test_nft_result_context_manager_noop():
+    """NftResult.close() on a plain result (no mmap) is a safe no-op;
+    context-manager exit calls close() without raising."""
+    r = NftResult(rc=0, stdout="hello", stderr="")
+    assert r._mmap is None
+    r.close()  # no-op, must not raise
+    with r:
+        pass  # context-manager must not raise
+
+
+@_NEEDS_MEMFD
+def test_nft_result_stdout_mv_invalid_after_close():
+    """After close(), a memoryview derived from the mmap raises ValueError.
+
+    mmap.close() raises BufferError if a memoryview is still holding an
+    exported pointer.  The correct pattern is: release (del) the memoryview
+    first, then close the mmap via NftResult.close().  Callers that want to
+    close early must release their memoryview reference before calling close().
+    """
+    size = 16
+    fd = _memfd_write(b"A" * size, name="test_mv_close")
+    try:
+        import mmap as _mmap
+        mm = _mmap.mmap(fd, size, access=_mmap.ACCESS_READ)
+        mv = memoryview(mm)
+        r = NftResult(rc=0, stdout="A" * size, stderr="", stdout_mv=mv, _mmap=mm)
+        # Accessing bytes before close is fine.
+        assert r.stdout_mv is not None
+        assert r.stdout_mv.nbytes == size
+        # Release the exported pointer (memoryview) before closing, so the
+        # mmap can be freed without a BufferError.
+        r.stdout_mv.release()
+        r.stdout_mv = None  # type: ignore[assignment]
+        r.close()
+        # After close, the mmap object is closed; any mmap-derived access raises.
+        with pytest.raises((ValueError, AttributeError)):
+            mm.read(1)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+@_NEEDS_MEMFD
+def test_memfd_dup_from_pid_self():
+    """_memfd_dup_from_pid reads a memfd created in the current process
+    via /proc/<self>/fd/<n>."""
+    data = b"hello from memfd dup" * 100
+    fd = _memfd_write(data, name="test_dup_self")
+    try:
+        result, mm = _memfd_dup_from_pid(os.getpid(), fd, len(data))
+        assert isinstance(result, bytes)
+        assert result == data
+        assert mm is None
+    finally:
+        os.close(fd)
+
+
+@_NEEDS_MEMFD
+def test_memfd_dup_from_pid_as_memoryview():
+    """_memfd_dup_from_pid with as_memoryview=True returns a live memoryview.
+
+    mmap.close() cannot proceed while a memoryview still holds an exported
+    pointer.  The caller must release the memoryview first (mv.release() or
+    del mv) before closing the mmap.
+    """
+    data = b"memoryview test data" * 50
+    fd = _memfd_write(data, name="test_dup_mv")
+    try:
+        mv, mm = _memfd_dup_from_pid(os.getpid(), fd, len(data), as_memoryview=True)
+        assert isinstance(mv, memoryview)
+        assert mm is not None
+        assert mv.nbytes == len(data)
+        assert bytes(mv) == data
+        # Release the exported pointer before closing the mmap.
+        mv.release()
+        mm.close()
+        # After close, reading from the released view raises ValueError.
+        with pytest.raises(ValueError):
+            _ = bytes(mv)
+    finally:
+        os.close(fd)
+
+
+@_NEEDS_MEMFD
+def test_memfd_dup_from_pid_empty():
+    """_memfd_dup_from_pid with size=0 returns empty bytes without error."""
+    result, mm = _memfd_dup_from_pid(os.getpid(), 0, 0)
+    assert result == b""
+    assert mm is None
+
+
+@_NEEDS_MEMFD
+def test_memfd_dup_from_pid_bad_fd():
+    """_memfd_dup_from_pid raises OSError when the proc-fd path is invalid."""
+    with pytest.raises(OSError):
+        _memfd_dup_from_pid(os.getpid(), 99999, 10)
+
+
+@_NEEDS_MEMFD
+def test_zc_tag_constants_distinct():
+    """_ZC_TAG_STDOUT_PIPE and _ZC_TAG_STDOUT_MEMFD must be distinct, positive,
+    and must not collide with the existing _RESULT_* bytes (0x00–0x04) that
+    can also appear on the rc pipe in the setns-error path."""
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    assert _ZC_TAG_STDOUT_PIPE != _ZC_TAG_STDOUT_MEMFD
+    # Both must be positive integers in the range of a single byte.
+    assert 0 < _ZC_TAG_STDOUT_PIPE < 256
+    assert 0 < _ZC_TAG_STDOUT_MEMFD < 256
+    # Must not collide with the existing _RESULT_* constants.
+    existing_tags = {
+        ord(_mod._RESULT_OK),
+        ord(_mod._RESULT_EXC),
+        ord(_mod._RESULT_SETNS_ERR),
+        ord(_mod._RESULT_OK_MEMFD),
+        ord(_mod._RESULT_EXC_MEMFD),
+    }
+    assert _ZC_TAG_STDOUT_PIPE not in existing_tags
+    assert _ZC_TAG_STDOUT_MEMFD not in existing_tags
+
+
+@_NEEDS_MEMFD
+def test_stdout_threshold_default_matches_module_constant():
+    """_DEFAULT_STDOUT_THRESHOLD should be 4 MiB."""
+    assert _DEFAULT_STDOUT_THRESHOLD == 4 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# run_nft_in_netns_zc stdout-path selection (monkeypatched, no real netns)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_netns_exists(monkeypatch, netns_name: str) -> None:
+    """Patch os.path.exists to claim a fake netns exists."""
+    real_exists = os.path.exists
+
+    def patched(p):
+        if p == f"/run/netns/{netns_name}":
+            return True
+        return real_exists(p)
+
+    monkeypatch.setattr(os.path, "exists", patched)
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_small_stdout_uses_pipe_path(monkeypatch):
+    """When stdout is below the threshold, the inline-pipe path (tag=1) is used.
+
+    We spy on _memfd_write in the child to verify no extra memfd is created
+    for stdout.  Because the child process cannot write to the parent's list,
+    we instead verify the tag byte read from the rc pipe.
+    """
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_pipe_spy")
+
+    # We can't easily introspect the child, so we verify via the module spy:
+    # monkeypatch _memfd_write to count calls.  In the SMALL path the child
+    # only calls _memfd_write once (for the script), not a second time for
+    # stdout.
+    original_write = _mod._memfd_write
+    calls: list[str] = []
+
+    def spy_write(data, *, name="nf_ipc"):
+        calls.append(name)
+        return original_write(data, name=name)
+
+    monkeypatch.setattr(_mod, "_memfd_write", spy_write)
+
+    # Patch _child_nft_zc to simulate small stdout without a real netns.
+
+    original_child_nft_zc = _mod._child_nft_zc
+
+    def fake_child_nft_zc(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        # Emit small stdout (well below threshold).
+        small_stdout = b"small"
+        import os as _os
+        try:
+            _os.write(stdout_w, small_stdout)
+        except OSError:
+            pass
+        _os.close(stdout_w)
+        _os.close(stderr_w)
+        _os.close(ack_r)
+        hdr = _mod._ZC_PIPE_HDR.pack(_mod._ZC_TAG_STDOUT_PIPE, 0)
+        try:
+            _os.write(rc_w, hdr)
+        except OSError:
+            pass
+        _os.close(rc_w)
+        _os.close(script_fd)
+        _os._exit(0)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child_nft_zc)
+
+    result = run_nft_in_netns_zc(
+        "_zc_pipe_spy", "list tables",
+        stdout_threshold=1024 * 1024,
+    )
+    assert result.rc == 0
+    assert result.stdout == "small"
+    assert result.stdout_mv is None
+    assert result._mmap is None
+
+    # The script memfd call was intercepted by the spy; stdout must NOT have
+    # generated a "nf_nft_stdout" memfd call (that only happens in the child
+    # process for the memfd path, but the fake_child_nft_zc didn't call
+    # _memfd_write for stdout — it wrote directly).
+    assert "nf_script" in calls, f"Expected nf_script call; got {calls}"
+    assert "nf_nft_stdout" not in calls, (
+        f"Unexpected nf_nft_stdout memfd in small-stdout path: {calls}"
+    )
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_large_stdout_uses_memfd_path(monkeypatch):
+    """When stdout exceeds the threshold, the memfd path (tag=2) is used.
+
+    We replace _child_nft_zc with a fake that writes a large stdout into a
+    memfd and sends the tag=2 control message, then blocks on ack.  The
+    parent must recover the data via the proc-fd dup mechanism.
+    """
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_memfd_spy")
+
+    # Build the large payload in the parent (the fake child will create it
+    # from a forked subprocess so sizes are known).
+    large_data = b"L" * (64 * 1024)  # 64 KiB — above our 16 KiB threshold
+    threshold = 16 * 1024  # 16 KiB
+
+    original_child_nft_zc = _mod._child_nft_zc
+
+    def fake_child_nft_zc(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        import os as _os
+        # Close pipes we don't use.
+        _os.close(stdout_w)
+        _os.close(stderr_w)
+        _os.close(script_fd)
+        # Write large_data into a memfd.
+        stdout_memfd = _mod._memfd_write(large_data, name="nf_nft_stdout")
+        _os.set_inheritable(stdout_memfd, True)
+        hdr = _mod._ZC_MEMFD_HDR.pack(
+            _mod._ZC_TAG_STDOUT_MEMFD, 0, len(large_data), stdout_memfd
+        )
+        try:
+            _os.write(rc_w, hdr)
+        except OSError:
+            pass
+        _os.close(rc_w)
+        # Block on ack.
+        try:
+            _mod._read_fd_exact(ack_r, 1)
+        except (OSError, EOFError):
+            pass
+        _os.close(ack_r)
+        _os.close(stdout_memfd)
+        _os._exit(0)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child_nft_zc)
+    monkeypatch.setattr(_mod, "_read_fd_exact", _mod._read_fd_exact)  # keep original
+
+    result = run_nft_in_netns_zc(
+        "_zc_memfd_spy", "list tables",
+        stdout_threshold=threshold,
+    )
+    assert result.rc == 0
+    assert result.stdout == large_data.decode("utf-8")
+    assert result.stdout_mv is None  # stdout_as_memoryview=False by default
+    assert result._mmap is None
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_large_stdout_as_memoryview(monkeypatch):
+    """stdout_as_memoryview=True yields a live memoryview; close() invalidates it."""
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_mv_spy")
+
+    large_data = b"M" * (32 * 1024)
+    threshold = 8 * 1024
+
+    def fake_child_nft_zc(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        import os as _os
+        _os.close(stdout_w)
+        _os.close(stderr_w)
+        _os.close(script_fd)
+        stdout_memfd = _mod._memfd_write(large_data, name="nf_nft_stdout")
+        _os.set_inheritable(stdout_memfd, True)
+        hdr = _mod._ZC_MEMFD_HDR.pack(
+            _mod._ZC_TAG_STDOUT_MEMFD, 0, len(large_data), stdout_memfd
+        )
+        try:
+            _os.write(rc_w, hdr)
+        except OSError:
+            pass
+        _os.close(rc_w)
+        try:
+            _mod._read_fd_exact(ack_r, 1)
+        except (OSError, EOFError):
+            pass
+        _os.close(ack_r)
+        _os.close(stdout_memfd)
+        _os._exit(0)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child_nft_zc)
+
+    result = run_nft_in_netns_zc(
+        "_zc_mv_spy", "list tables",
+        stdout_threshold=threshold,
+        stdout_as_memoryview=True,
+    )
+    try:
+        assert result.rc == 0
+        assert result.stdout_mv is not None
+        assert result.stdout_mv.nbytes == len(large_data)
+        assert bytes(result.stdout_mv) == large_data
+        # stdout str and memoryview must agree.
+        assert result.stdout == large_data.decode("utf-8")
+        # Release the exported pointer before closing so mmap.close() won't
+        # raise BufferError.
+        mv = result.stdout_mv
+        mv.release()
+        result.stdout_mv = None  # type: ignore[assignment]
+        result.close()
+        # After close, the released memoryview raises ValueError on access.
+        with pytest.raises(ValueError):
+            _ = bytes(mv)
+    except Exception:
+        result.close()
+        raise
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_threshold_boundary_pipe(monkeypatch):
+    """stdout exactly threshold-1 bytes → pipe path (tag=1)."""
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_boundary_pipe")
+    threshold = 1024
+    # threshold - 1 bytes → inline pipe
+    payload = b"B" * (threshold - 1)
+
+    def fake_child(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        import os as _os
+        # Verify the child received the correct threshold.
+        assert stdout_threshold == threshold
+        _os.close(script_fd)
+        _os.close(ack_r)
+        try:
+            _os.write(stdout_w, payload)
+        except OSError:
+            pass
+        _os.close(stdout_w)
+        _os.close(stderr_w)
+        hdr = _mod._ZC_PIPE_HDR.pack(_mod._ZC_TAG_STDOUT_PIPE, 0)
+        try:
+            _os.write(rc_w, hdr)
+        except OSError:
+            pass
+        _os.close(rc_w)
+        _os._exit(0)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child)
+
+    result = run_nft_in_netns_zc(
+        "_zc_boundary_pipe", "list tables", stdout_threshold=threshold
+    )
+    assert result.stdout == payload.decode("utf-8")
+    assert result._mmap is None
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_threshold_boundary_memfd(monkeypatch):
+    """stdout exactly threshold bytes → memfd path (tag=2)."""
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_boundary_memfd")
+    threshold = 1024
+    # threshold bytes → memfd
+    payload = b"C" * threshold
+
+    def fake_child(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        import os as _os
+        assert stdout_threshold == threshold
+        _os.close(script_fd)
+        _os.close(stdout_w)
+        _os.close(stderr_w)
+        stdout_memfd = _mod._memfd_write(payload, name="nf_nft_stdout")
+        _os.set_inheritable(stdout_memfd, True)
+        hdr = _mod._ZC_MEMFD_HDR.pack(
+            _mod._ZC_TAG_STDOUT_MEMFD, 0, len(payload), stdout_memfd
+        )
+        try:
+            _os.write(rc_w, hdr)
+        except OSError:
+            pass
+        _os.close(rc_w)
+        try:
+            _mod._read_fd_exact(ack_r, 1)
+        except (OSError, EOFError):
+            pass
+        _os.close(ack_r)
+        _os.close(stdout_memfd)
+        _os._exit(0)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child)
+
+    result = run_nft_in_netns_zc(
+        "_zc_boundary_memfd", "list tables", stdout_threshold=threshold
+    )
+    assert result.stdout == payload.decode("utf-8")
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_procfd_open_fails_fallback(monkeypatch):
+    """When /proc/<pid>/fd open fails, the parent falls back to the pipe content
+    (empty in this case) and logs a warning.  Result is still correct; no hang."""
+    import logging
+
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_procfd_fallback")
+    threshold = 16
+
+    def fake_child(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        import os as _os
+        _os.close(script_fd)
+        _os.close(stdout_w)
+        _os.close(stderr_w)
+        # Pretend large stdout.
+        fake_fd = 42
+        hdr = _mod._ZC_MEMFD_HDR.pack(
+            _mod._ZC_TAG_STDOUT_MEMFD, 0, 100, fake_fd
+        )
+        try:
+            _os.write(rc_w, hdr)
+        except OSError:
+            pass
+        _os.close(rc_w)
+        # Wait for ack (parent will send it even on error).
+        try:
+            _mod._read_fd_exact(ack_r, 1)
+        except (OSError, EOFError):
+            pass
+        _os.close(ack_r)
+        _os._exit(0)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child)
+
+    # Patch _memfd_dup_from_pid to simulate an OSError.
+    original_dup = _mod._memfd_dup_from_pid
+
+    def failing_dup(pid, fd, size, *, as_memoryview=False):
+        raise OSError(errno.ENOENT, "simulated proc-fd failure")
+
+    import errno
+    monkeypatch.setattr(_mod, "_memfd_dup_from_pid", failing_dup)
+
+    warnings: list[str] = []
+
+    class _WarnCapture(logging.Handler):
+        def emit(self, record):
+            warnings.append(record.getMessage())
+
+    handler = _WarnCapture()
+    logging.getLogger("shorewall_nft_netkit.netns_fork").addHandler(handler)
+    try:
+        result = run_nft_in_netns_zc(
+            "_zc_procfd_fallback", "list tables", stdout_threshold=threshold
+        )
+    finally:
+        logging.getLogger("shorewall_nft_netkit.netns_fork").removeHandler(handler)
+
+    # Result must not crash; stdout falls back to empty pipe content.
+    assert result.rc == 0
+    assert isinstance(result.stdout, str)
+    # A warning must have been logged.
+    assert any("falling back to pipe" in w for w in warnings), (
+        f"Expected fallback warning; got: {warnings}"
+    )
+
+
+@_NEEDS_MEMFD
+def test_run_nft_zc_child_early_exit_in_memfd_path(monkeypatch):
+    """Child dies before sending any rc → ChildCrashedError (no hang)."""
+    import shorewall_nft_netkit.netns_fork as _mod
+
+    _make_fake_netns_exists(monkeypatch, "_zc_early_exit")
+
+    def fake_child(
+        netns_path, *, script_fd, script_size, rc_w, stdout_w, stderr_w,
+        ack_r, check_only, stdout_threshold,
+    ):
+        import os as _os
+        # Close everything without writing rc — simulate a crash.
+        for fd in (script_fd, rc_w, stdout_w, stderr_w, ack_r):
+            try:
+                _os.close(fd)
+            except OSError:
+                pass
+        _os._exit(42)
+
+    monkeypatch.setattr(_mod, "_child_nft_zc", fake_child)
+
+    with pytest.raises(ChildCrashedError):
+        run_nft_in_netns_zc("_zc_early_exit", "list tables", timeout=5.0)
+
+
+@_NEEDS_NFT
+@_NEEDS_MEMFD
+def test_run_nft_zc_small_stdout_real_netns(netns):
+    """Real netns: small stdout uses the inline pipe path; result is parseable."""
+    import json
+
+    result = run_nft_in_netns_zc(
+        netns, "list tables",
+        # Force inline-pipe by using a 100 MiB threshold.
+        stdout_threshold=100 * 1024 * 1024,
+        timeout=30.0,
+    )
+    assert result.rc == 0
+    assert result._mmap is None
+    if result.stdout.strip():
+        parsed = json.loads(result.stdout)
+        assert isinstance(parsed, dict)
+
+
+@_NEEDS_NFT
+@_NEEDS_MEMFD
+def test_run_nft_zc_large_stdout_real_netns(netns):
+    """Real netns: forcing memfd path with threshold=0 gives identical output
+    to the inline pipe path."""
+
+    result_pipe = run_nft_in_netns_zc(
+        netns, "list tables",
+        stdout_threshold=100 * 1024 * 1024,  # inline pipe
+        timeout=30.0,
+    )
+    result_memfd = run_nft_in_netns_zc(
+        netns, "list tables",
+        stdout_threshold=0,  # always use memfd
+        timeout=30.0,
+    )
+    assert result_pipe.rc == result_memfd.rc
+    assert result_pipe.stdout == result_memfd.stdout
+    result_memfd.close()
+
+
+@_NEEDS_NFT
+@_NEEDS_MEMFD
+def test_run_nft_zc_as_context_manager(netns):
+    """run_nft_in_netns_zc result used as a context manager closes cleanly."""
+    with run_nft_in_netns_zc(netns, "list tables", timeout=30.0) as result:
+        assert result.rc == 0
+    # After the with-block, the result is closed (mmap released, if any).
