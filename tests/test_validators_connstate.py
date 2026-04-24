@@ -347,34 +347,38 @@ class TestRunSmallConntrackProbe:
             f"Expected all NFCTSocket calls to use 'probe-fw-ns'; got: {set(nfct_calls)}"
         )
 
-    def test_socket_create_connection_fires_for_tcp(self):
-        """socket.create_connection must be called for the TCP probe."""
-        sock_mock = _make_socket_mock()
-        # Allow create_connection to succeed this time.
-        fake_conn = MagicMock()
-        fake_conn.sendall.return_value = None
-        fake_conn.close.return_value = None
-        sock_mock.create_connection.return_value = fake_conn
-        sock_mock.create_connection.side_effect = None  # override OSError
+    def test_no_self_injected_traffic(self):
+        """The validator must NOT generate its own probes.
 
+        Earlier revisions injected TCP/UDP/ICMP packets via
+        ``socket.create_connection`` / ``socket.socket`` in the
+        *caller's* namespace; that traffic never traversed the firewall
+        netns and the kernel correctly never created ct entries there.
+        The function now snapshots the FW netns ct table only — the
+        simlab probe sweep that runs before this call is the source of
+        the entries we count.
+        """
+        sock_mock = _make_socket_mock()
         with patch(_SOCKET_PATCH, sock_mock), \
              patch(_NFCT_PATCH, _make_nfct_mock(1)):
             run_small_conntrack_probe("10.0.0.1")
+        sock_mock.create_connection.assert_not_called()
+        sock_mock.socket.assert_not_called()
 
-        sock_mock.create_connection.assert_called_once_with(("10.0.0.1", 80), timeout=1)
-
-    def test_socket_error_does_not_propagate(self):
-        """OSError from socket calls must be silently consumed."""
+    def test_dst_ip_and_port_args_are_noops(self):
+        """``dst_ip`` and ``port`` are kept for API back-compat but no
+        longer drive any traffic generation."""
         sock_mock = _make_socket_mock()
-        sock_mock.create_connection.side_effect = OSError("connection refused")
-        sock_mock.socket.side_effect = OSError("raw socket not permitted")
-
         with patch(_SOCKET_PATCH, sock_mock), \
-             patch(_NFCT_PATCH, _make_nfct_mock(0)):
-            results = run_small_conntrack_probe()
-
-        # Function must complete and return 4 results.
-        assert len(results) == 4
+             patch(_NFCT_PATCH, _make_nfct_mock(2)):
+            results_a = run_small_conntrack_probe("10.0.0.1", port=80)
+        with patch(_SOCKET_PATCH, sock_mock), \
+             patch(_NFCT_PATCH, _make_nfct_mock(2)):
+            results_b = run_small_conntrack_probe("203.0.113.99", port=443)
+        # Both invocations must produce identical structure.
+        assert [r.name for r in results_a] == [r.name for r in results_b]
+        assert all(r.passed for r in results_a)
+        assert all(r.passed for r in results_b)
 
     def test_exception_in_count_treated_as_zero(self):
         """If NFCTSocket raises, _ct_count returns 0 and results fail."""

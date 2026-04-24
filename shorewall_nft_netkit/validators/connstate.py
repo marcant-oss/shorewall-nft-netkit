@@ -390,32 +390,33 @@ else:
 
 
 def run_small_conntrack_probe(
-    dst_ip: str = "203.0.113.5",
-    port: int = 80,
+    dst_ip: str = "203.0.113.5",  # noqa: ARG001  kept for API stability
+    port: int = 80,                # noqa: ARG001  kept for API stability
     *,
     ns_name: str = _DEFAULT_NS_FW,
 ) -> list[ConnStateResult]:
-    """Small-scale conntrack verification.
+    """Snapshot the FW netns's conntrack table.
 
-    Drives a handful of real flows and verifies the kernel conntrack table
-    in the FW netns actually tracks them.  Deliberately small (3-4 probes)
-    — not a load test, just a signal that ct is working.
+    The previous implementation generated TCP/UDP/ICMP probes in the
+    *caller's* namespace — that traffic never traversed the firewall, so
+    the kernel naturally never created ct entries in the FW netns. This
+    revision drops self-injected traffic entirely: the caller is expected
+    to run the simlab probe sweep first; this function then snapshots
+    the FW netns's conntrack table via NFCTSocket and reports per-proto
+    counts. Non-zero per-proto counts indicate that conntrack is
+    correctly tracking flows the simlab harness pushed through.
 
-    Unlike the original ``shorewall_nft.verify.connstate`` implementation,
-    the TCP/UDP/ICMP injectors here use :func:`socket.create_connection` /
-    :func:`socket.socket` in the calling process's network namespace rather
-    than running ``nc`` / ``ping`` in a separate NS_SRC namespace.  This
-    makes the validator runtime-neutral: the caller sets up whatever netns
-    it needs before calling this function.
+    The ``dst_ip`` / ``port`` arguments are kept for API back-compat —
+    they have no effect because this function no longer generates its
+    own probes.
 
     Args:
-        dst_ip: Destination IP to probe (default: 203.0.113.5, a
-                documentation address that is routed to the firewall in
-                the simulate.py topology).
-        port:   TCP/UDP destination port for the TCP and UDP probes
-                (default: 80).
-        ns_name: Name of the FW network namespace that holds the conntrack
-                 table to inspect.  Defaults to the simulate.py NS_FW.
+        ns_name: Name of the FW netns whose conntrack table to inspect.
+
+    Returns:
+        ConnStateResult list with per-proto entry counts plus a
+        non-empty-table sanity check. ``passed`` flags follow the
+        convention "≥1 entry visible".
     """
     results: list[ConnStateResult] = []
 
@@ -428,83 +429,31 @@ def run_small_conntrack_probe(
         except Exception:  # noqa: BLE001
             return 0
 
-    def _ct_flush() -> None:
-        try:
-            with NFCTSocket(netns=ns_name, flags=os.O_RDONLY) as ct:
-                ct.flush()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # 1. TCP flow should create a tcp conntrack entry.
-    #    We use socket.create_connection() so no NS_SRC namespace is needed.
-    #    The caller is expected to already be running in the correct netns.
-    _ct_flush()
     start = time.monotonic_ns()
-    try:
-        s = socket.create_connection((dst_ip, port), timeout=1)
-        s.sendall(b"CT_TEST\n")
-        s.close()
-    except (socket.timeout, OSError):
-        pass  # expected — probing for ct entry creation, not success
     tcp_n = _ct_count("tcp")
+    udp_n = _ct_count("udp")
+    icmp_n = _ct_count("icmp")
     ms = (time.monotonic_ns() - start) // 1_000_000
+
     results.append(ConnStateResult(
         name="ct:tcp_flow_tracked",
         passed=tcp_n >= 1,
-        detail=f"tcp conntrack entries after probe: {tcp_n}",
+        detail=f"tcp conntrack entries: {tcp_n}",
         ms=ms,
     ))
-
-    # 2. UDP flow should create a udp conntrack entry.
-    _ct_flush()
-    start = time.monotonic_ns()
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(1)
-        s.sendto(b"PING\n", (dst_ip, 65001))
-        s.close()
-    except (socket.timeout, OSError):
-        pass
-    udp_n = _ct_count("udp")
-    ms = (time.monotonic_ns() - start) // 1_000_000
     results.append(ConnStateResult(
         name="ct:udp_flow_tracked",
         passed=udp_n >= 1,
-        detail=f"udp conntrack entries after probe: {udp_n}",
-        ms=ms,
+        detail=f"udp conntrack entries: {udp_n}",
+        ms=0,
     ))
-
-    # 3. ICMP echo should create an icmp conntrack entry.
-    _ct_flush()
-    start = time.monotonic_ns()
-    try:
-        # Raw ICMP echo request — requires CAP_NET_RAW (available under
-        # unshare --user --map-root-user).
-        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        s.settimeout(1)
-        # Build a minimal ICMP echo request (type=8, code=0).
-        import struct
-        header = struct.pack("!BBHHH", 8, 0, 0, os.getpid() & 0xFFFF, 1)
-        checksum = 0
-        for i in range(0, len(header), 2):
-            checksum += (header[i] << 8) | header[i + 1]
-        checksum = (~((checksum >> 16) + (checksum & 0xFFFF))) & 0xFFFF
-        header = struct.pack("!BBHHH", 8, 0, checksum, os.getpid() & 0xFFFF, 1)
-        s.sendto(header, (dst_ip, 0))
-        s.close()
-    except (socket.timeout, OSError, PermissionError):
-        pass
-    icmp_n = _ct_count("icmp")
-    ms = (time.monotonic_ns() - start) // 1_000_000
     results.append(ConnStateResult(
         name="ct:icmp_flow_tracked",
         passed=icmp_n >= 1,
-        detail=f"icmp conntrack entries after probe: {icmp_n}",
-        ms=ms,
+        detail=f"icmp conntrack entries: {icmp_n}",
+        ms=0,
     ))
-
-    # 4. ct is non-empty in normal operation (sanity)
-    total_n = _ct_count("tcp") + _ct_count("udp") + _ct_count("icmp")
+    total_n = tcp_n + udp_n + icmp_n
     results.append(ConnStateResult(
         name="ct:table_nonempty",
         passed=total_n >= 1,
