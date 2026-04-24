@@ -5,6 +5,70 @@ Low-level netns / TUN-TAP / packet-construction primitives shared by
 
 **Development: use the repo-root venv at `../../.venv/` (Python 3.13).**
 
+## Shared validator layer (`validators/`)
+
+The `validators/` sub-package was added in Phase II of the dual-stack plan
+to give both `verify/simulate.py` and `shorewall-nft-simlab` a single,
+runtime-neutral validator implementation.  Every function accepts `ns_name`
+as a keyword argument so it works in any named network namespace.
+
+### Why here?
+
+The original validators lived in `shorewall_nft.verify.tc_validate` and
+`shorewall_nft.verify.connstate` and hard-coded `NS_FW = "shorewall-next-sim-fw"`.
+Moving them to netkit:
+
+1. Makes them available to simlab without a circular import (netkit does
+   not depend on shorewall-nft's config/compiler machinery — callers
+   pass pre-parsed data).
+2. Lets the `ns_name` default preserve simulate.py back-compat while
+   allowing simlab to use its own namespace name.
+3. Centralises the pyroute2 `NFCTSocket` usage in one place.
+
+The original modules (`shorewall_nft.verify.tc_validate` and
+`shorewall_nft.verify.connstate`) are now thin re-export shims; existing
+callers are unaffected.
+
+### API
+
+```python
+from shorewall_nft_netkit.validators import (
+    # tc_validate
+    ValidationResult,
+    validate_tc,         # TC script generation check (pure; ns_name reserved)
+    validate_sysctl,     # sysctl-vs-config conformance  (ns_name: fw namespace)
+    validate_routing,    # IP forwarding + interface presence
+    validate_nft_loaded, # nft table + base chains loaded
+    run_all_validations, # orchestrator
+
+    # connstate
+    ConnStateResult,
+    run_small_conntrack_probe,  # 4-probe ct sanity (socket injector, no NS_SRC)
+    run_connstate_tests,        # full scapy ct test suite
+    test_established_tcp, test_drop_not_syn, test_invalid_flags,
+    test_syn_to_allowed, test_syn_to_blocked,
+    test_udp_conntrack, test_rfc1918_blocked,
+)
+```
+
+### `ns_name` default
+
+`"shorewall-next-sim-fw"` — matches simulate.py's `NS_FW` constant.
+Pass any other name when running inside a different topology.
+
+### Injector change in `run_small_conntrack_probe`
+
+The old implementation called `ns(NS_SRC, "nc ...")` to generate TCP/UDP
+flows.  The new implementation uses `socket.create_connection()` /
+`socket.socket()` in the **calling process's netns**.  This means:
+
+- No dependency on a separate NS_SRC namespace.
+- The caller is responsible for entering the correct netns before calling
+  the probe (simulate.py does this naturally since it already runs inside
+  NS_FW at probe time).
+- `PermissionError` / `OSError` from raw sockets is caught and silently
+  ignored — the ct-count assertion still fires.
+
 ## Shared primitives
 
 - `nsstub.py` — `spawn_nsstub(name)` / `stop_nsstub(name, pid)`: fork a
