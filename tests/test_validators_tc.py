@@ -12,6 +12,7 @@ These tests verify:
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,19 @@ from shorewall_nft_netkit.validators.tc_validate import (
     validate_routing,
     validate_sysctl,
     validate_tc,
+)
+
+# Some tests below exercise the lazy imports inside ``validate_sysctl``
+# and ``validate_tc`` (which pull in ``shorewall_nft.compiler.sysctl`` /
+# ``shorewall_nft.config.parser`` / ``shorewall_nft.compiler.tc``).
+# Skip those classes when the shorewall-nft core package isn't
+# installed — the netkit CI runs without it.
+_HAS_SHOREWALL_NFT = importlib.util.find_spec("shorewall_nft") is not None
+_requires_shorewall_nft = pytest.mark.skipif(
+    not _HAS_SHOREWALL_NFT,
+    reason="shorewall-nft core not installed (netkit CI); skipping "
+           "integration tests that exercise the lazy shorewall_nft "
+           "imports inside validate_sysctl / validate_tc.",
 )
 
 # Canonical patch target for _ns inside the validators module.
@@ -197,6 +211,7 @@ class TestValidateRoutingNsName:
 # validate_sysctl — ns_name threading
 # ---------------------------------------------------------------------------
 
+@_requires_shorewall_nft
 class TestValidateSysctlNsName:
     def test_ns_name_threaded_to_each_sysctl_read(self, monkeypatch):
         calls = []
@@ -247,6 +262,7 @@ class TestValidateSysctlNsName:
 # validate_tc — ns_name accepted (pure generation, no netns reads)
 # ---------------------------------------------------------------------------
 
+@_requires_shorewall_nft
 class TestValidateTcNsName:
     def test_empty_tc_config_passes(self):
         from shorewall_nft.compiler.tc import TcConfig
@@ -342,6 +358,7 @@ class TestValidateNftLoadedNsName:
 # run_all_validations — orchestrator wires ns_name through
 # ---------------------------------------------------------------------------
 
+@_requires_shorewall_nft
 class TestRunAllValidations:
     def test_ns_name_propagated_to_all_sub_validators(self, monkeypatch):
         """run_all_validations must thread ns_name to all three sub-validators."""
