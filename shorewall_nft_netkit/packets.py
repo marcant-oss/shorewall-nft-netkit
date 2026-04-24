@@ -274,6 +274,187 @@ def _next_sport() -> int:
     return _eph_counter
 
 
+# ── REJECT correlator helpers (G3 — fast byte-level extraction) ──────
+#
+# These helpers are pure Python / struct operations so they run on the
+# reader-thread hot path without acquiring the GIL for scapy.
+#
+# TCP flags byte (offset into the TCP header):
+#   SYN = 0x02, ACK = 0x10, RST = 0x04, FIN = 0x01
+#
+# 5-tuple used as reverse-lookup key for ICMP unreachable correlation:
+#   (family: int, proto: int, saddr: str, daddr: str, sport: int, dport: int)
+
+TCP_FLAG_FIN = 0x01
+TCP_FLAG_SYN = 0x02
+TCP_FLAG_RST = 0x04
+TCP_FLAG_ACK = 0x10
+
+
+def fast_extract_tcp_flags(raw: bytes, is_tap: bool = True) -> int | None:
+    """Extract the TCP flags byte from a raw frame without scapy.
+
+    Supports both TAP (Ethernet-framed) and TUN (bare IP) frames, for
+    both IPv4 and IPv6.
+
+    Returns the flags byte (int) on success, or ``None`` when the frame
+    is not a recognisable TCP segment.
+
+    TCP flags byte position:
+        Ethernet (14) + IPv4 (20) + TCP-flags at offset 13 in TCP header
+        = 14 + 20 + 13 = 47 (v4, TAP)
+        Ethernet (14) + IPv6 (40) + TCP-flags at offset 13
+        = 14 + 40 + 13 = 67 (v6, TAP)
+        TUN: subtract the 14 Ethernet bytes from each.
+    """
+    eth = 14 if is_tap else 0
+
+    if is_tap:
+        if len(raw) < 14:
+            return None
+        etype = (raw[12] << 8) | raw[13]
+        if etype == 0x0800:   # IPv4
+            ip_ver = 4
+        elif etype == 0x86dd:  # IPv6
+            ip_ver = 6
+        else:
+            return None
+    else:
+        if len(raw) < 1:
+            return None
+        ip_ver = raw[0] >> 4
+
+    if ip_ver == 4:
+        if len(raw) < eth + 20:
+            return None
+        # IHL field tells us the IPv4 header length in 32-bit words
+        ihl = (raw[eth] & 0x0f) * 4
+        proto = raw[eth + 9]
+        if proto != 6:  # not TCP
+            return None
+        tcp_off = eth + ihl
+        if len(raw) < tcp_off + 14:
+            return None
+        return raw[tcp_off + 13]
+    elif ip_ver == 6:
+        if len(raw) < eth + 40:
+            return None
+        next_hdr = raw[eth + 6]
+        if next_hdr != 6:  # not TCP (extension headers not followed here)
+            return None
+        tcp_off = eth + 40
+        if len(raw) < tcp_off + 14:
+            return None
+        return raw[tcp_off + 13]
+    return None
+
+
+def fast_extract_icmp_unreachable(
+    raw: bytes, is_tap: bool = True
+) -> tuple[int, tuple] | None:
+    """Extract (icmp_code, inner_5tuple) from an ICMP Destination Unreachable.
+
+    Handles both ICMPv4 (type 3) and ICMPv6 (type 1). Returns ``None``
+    when the frame is not an ICMP/ICMPv6 unreachable, or the inner
+    packet cannot be parsed.
+
+    The returned ``inner_5tuple`` has the form::
+
+        (family, proto, saddr, daddr, sport, dport)
+
+    where *saddr/daddr* are string dotted-decimal / colon-hex addresses
+    and *sport/dport* are ints (or 0 for non-TCP/UDP protocols).
+
+    ICMPv4 layout (TAP):
+        [14]    IPv4 outer header (variable, ≥ 20 bytes)
+        [14+ihl] ICMP: type(1) code(1) cksum(2) unused(4)
+        [14+ihl+8] inner IPv4 header + first 8 bytes of inner transport
+
+    ICMPv6 layout (TAP):
+        [14]    IPv6 outer header (40 bytes, next-header=58)
+        [54]    ICMPv6: type(1) code(1) cksum(2) unused(4)
+        [62]    inner IPv6 header + first 8 bytes of inner transport
+    """
+    eth = 14 if is_tap else 0
+
+    if is_tap:
+        if len(raw) < 14:
+            return None
+        etype = (raw[12] << 8) | raw[13]
+        if etype == 0x0800:
+            ip_ver = 4
+        elif etype == 0x86dd:
+            ip_ver = 6
+        else:
+            return None
+    else:
+        if len(raw) < 1:
+            return None
+        ip_ver = raw[0] >> 4
+
+    if ip_ver == 4:
+        # Outer IPv4
+        if len(raw) < eth + 20:
+            return None
+        proto = raw[eth + 9]
+        if proto != 1:  # not ICMP
+            return None
+        ihl = (raw[eth] & 0x0f) * 4
+        icmp_off = eth + ihl
+        # ICMP header: type(1) code(1) cksum(2) + 4 unused bytes = 8
+        if len(raw) < icmp_off + 8:
+            return None
+        icmp_type = raw[icmp_off]
+        if icmp_type != 3:  # not Destination Unreachable
+            return None
+        icmp_code = raw[icmp_off + 1]
+        # Inner IP header starts at icmp_off + 8
+        inner_off = icmp_off + 8
+        if len(raw) < inner_off + 20:
+            return None
+        inner_ihl = (raw[inner_off] & 0x0f) * 4
+        inner_proto = raw[inner_off + 9]
+        inner_src = socket.inet_ntoa(raw[inner_off + 12:inner_off + 16])
+        inner_dst = socket.inet_ntoa(raw[inner_off + 16:inner_off + 20])
+        sport, dport = 0, 0
+        trans_off = inner_off + inner_ihl
+        if inner_proto in (6, 17) and len(raw) >= trans_off + 4:
+            sport = (raw[trans_off] << 8) | raw[trans_off + 1]
+            dport = (raw[trans_off + 2] << 8) | raw[trans_off + 3]
+        return (icmp_code, (4, inner_proto, inner_src, inner_dst, sport, dport))
+
+    elif ip_ver == 6:
+        # Outer IPv6 (fixed 40-byte header, no extension-header follow here)
+        if len(raw) < eth + 40:
+            return None
+        next_hdr = raw[eth + 6]
+        if next_hdr != 58:  # not ICMPv6
+            return None
+        icmp_off = eth + 40
+        # ICMPv6 header: type(1) code(1) cksum(2) + 4 unused bytes = 8
+        if len(raw) < icmp_off + 8:
+            return None
+        icmp_type = raw[icmp_off]
+        if icmp_type != 1:  # ICMPv6 Destination Unreachable
+            return None
+        icmp_code = raw[icmp_off + 1]
+        # Inner IPv6 starts at icmp_off + 8
+        inner_off = icmp_off + 8
+        if len(raw) < inner_off + 40:
+            return None
+        inner_proto = raw[inner_off + 6]
+        inner_src = str(ipaddress.IPv6Address(raw[inner_off + 8:inner_off + 24]))
+        inner_dst = str(ipaddress.IPv6Address(raw[inner_off + 24:inner_off + 40]))
+        sport, dport = 0, 0
+        trans_off = inner_off + 40
+        if inner_proto in (6, 17) and len(raw) >= trans_off + 4:
+            sport = (raw[trans_off] << 8) | raw[trans_off + 1]
+            dport = (raw[trans_off + 2] << 8) | raw[trans_off + 3]
+        return (icmp_code, (6, inner_proto, inner_src, inner_dst, sport, dport))
+
+    return None
+
+
 # ── Lazy scapy import ────────────────────────────────────────────────
 
 _scapy: Any = None
