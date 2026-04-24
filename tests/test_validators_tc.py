@@ -47,16 +47,24 @@ def _make_stub_config(
     tcclasses=None,
     tcfilters=None,
 ):
-    """Build a minimal ShorewalConfig-like object with only TC fields."""
-    from shorewall_nft.config.parser import ConfigLine
+    """Build a minimal ShorewalConfig-like object with only TC fields.
 
-    def _make_config_line(cols):
-        return ConfigLine(columns=cols, file="test", lineno=1)
+    Uses a local duck-typed ConfigLine rather than
+    ``shorewall_nft.config.parser.ConfigLine`` so this test can run
+    without the shorewall-nft core package installed (the lazy
+    imports inside ``validate_tc`` / ``validate_sysctl`` are mocked
+    out by the tests that use them).
+    """
+    class _StubConfigLine:
+        def __init__(self, columns, file="test", lineno=1):
+            self.columns = columns
+            self.file = file
+            self.lineno = lineno
 
     cfg = MagicMock()
-    cfg.tcdevices = [_make_config_line(cols) for cols in (tcdevices or [])]
-    cfg.tcclasses = [_make_config_line(cols) for cols in (tcclasses or [])]
-    cfg.tcfilters = [_make_config_line(cols) for cols in (tcfilters or [])]
+    cfg.tcdevices = [_StubConfigLine(cols) for cols in (tcdevices or [])]
+    cfg.tcclasses = [_StubConfigLine(cols) for cols in (tcclasses or [])]
+    cfg.tcfilters = [_StubConfigLine(cols) for cols in (tcfilters or [])]
     return cfg
 
 
