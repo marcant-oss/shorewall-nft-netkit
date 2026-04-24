@@ -389,6 +389,67 @@ else:
         )
 
 
+def snapshot_ct_5tuples(
+    ns_name: str = _DEFAULT_NS_FW,
+) -> set[tuple]:
+    """Snapshot all conntrack entries in *ns_name* as 5-tuples.
+
+    Returns a ``set`` of tuples, each shaped as
+    ``(proto_num, src_ip_str, dst_ip_str, sport_int, dport_int)``.
+    For ICMP entries (no L4 ports) sport/dport are reported as 0.
+
+    Per-probe verification: simlab callers can compare a probe's
+    ``(proto, src_ip, dst_ip, sport, dport)`` against this set after
+    a batch finishes — an ACCEPT-verdict probe whose 5-tuple is
+    absent indicates either conntrack is broken in the FW netns or
+    the probe was dropped before conntrack got a chance to track it
+    (which contradicts the ACCEPT verdict).
+
+    Reads ``CTA_TUPLE_ORIG`` only — that's the direction the probe
+    was injected. Bidirectional reply observation is the caller's
+    business; this helper is intentionally one-directional and
+    cheap.
+    """
+    out: set[tuple] = set()
+    try:
+        with NFCTSocket(netns=ns_name, flags=os.O_RDONLY) as ct:
+            for msg in ct.dump():
+                try:
+                    attrs = dict(msg["attrs"])
+                except (TypeError, KeyError, ValueError):
+                    continue
+                orig = attrs.get("CTA_TUPLE_ORIG")
+                if orig is None:
+                    continue
+                try:
+                    orig_attrs = dict(orig["attrs"])
+                except (TypeError, KeyError, ValueError):
+                    continue
+                ip_block = orig_attrs.get("CTA_TUPLE_IP")
+                proto_block = orig_attrs.get("CTA_TUPLE_PROTO")
+                if ip_block is None or proto_block is None:
+                    continue
+                try:
+                    ipd = dict(ip_block["attrs"])
+                    pd = dict(proto_block["attrs"])
+                except (TypeError, KeyError, ValueError):
+                    continue
+                src = (ipd.get("CTA_IP_V4_SRC")
+                       or ipd.get("CTA_IP_V6_SRC"))
+                dst = (ipd.get("CTA_IP_V4_DST")
+                       or ipd.get("CTA_IP_V6_DST"))
+                pnum = pd.get("CTA_PROTO_NUM")
+                if src is None or dst is None or pnum is None:
+                    continue
+                sport = pd.get("CTA_PROTO_SRC_PORT") or 0
+                dport = pd.get("CTA_PROTO_DST_PORT") or 0
+                out.add((int(pnum), str(src), str(dst),
+                         int(sport), int(dport)))
+    except Exception:  # noqa: BLE001  — netns gone, module missing, etc.
+        pass
+    return out
+
+
 def run_small_conntrack_probe(
     dst_ip: str = "203.0.113.5",  # noqa: ARG001  kept for API stability
     port: int = 80,                # noqa: ARG001  kept for API stability

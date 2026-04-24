@@ -407,3 +407,107 @@ class TestRunSmallConntrackProbe:
              patch(_NFCT_PATCH, _make_nfct_mock(1)):
             results = run_small_conntrack_probe(ns_name=ns_name)
         assert len(results) == 4
+
+
+# ---------------------------------------------------------------------------
+# snapshot_ct_5tuples — per-probe verification helper
+# ---------------------------------------------------------------------------
+
+class TestSnapshotCt5Tuples:
+    def _make_msg(self, *, family: int, src: str, dst: str,
+                  proto_num: int, sport: int, dport: int):
+        """Forge a single pyroute2 ct dump message."""
+        ip_key_src = "CTA_IP_V4_SRC" if family == 4 else "CTA_IP_V6_SRC"
+        ip_key_dst = "CTA_IP_V4_DST" if family == 4 else "CTA_IP_V6_DST"
+        return {
+            "attrs": [
+                ("CTA_TUPLE_ORIG", {
+                    "attrs": [
+                        ("CTA_TUPLE_IP", {
+                            "attrs": [(ip_key_src, src), (ip_key_dst, dst)],
+                        }),
+                        ("CTA_TUPLE_PROTO", {
+                            "attrs": [
+                                ("CTA_PROTO_NUM", proto_num),
+                                ("CTA_PROTO_SRC_PORT", sport),
+                                ("CTA_PROTO_DST_PORT", dport),
+                            ],
+                        }),
+                    ],
+                }),
+            ],
+        }
+
+    def test_returns_v4_5tuples(self):
+        from shorewall_nft_netkit.validators import snapshot_ct_5tuples
+
+        msgs = [
+            self._make_msg(
+                family=4, src="10.0.0.1", dst="10.0.0.2",
+                proto_num=6, sport=12345, dport=80,
+            ),
+            self._make_msg(
+                family=4, src="10.0.0.3", dst="10.0.0.4",
+                proto_num=17, sport=33333, dport=53,
+            ),
+        ]
+
+        class _CtSpy:
+            def __init__(self, *_a, **_k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def dump(self):
+                return iter(msgs)
+
+        with patch(_NFCT_PATCH, _CtSpy):
+            tuples = snapshot_ct_5tuples(ns_name="probe-ns")
+
+        assert (6, "10.0.0.1", "10.0.0.2", 12345, 80) in tuples
+        assert (17, "10.0.0.3", "10.0.0.4", 33333, 53) in tuples
+        assert len(tuples) == 2
+
+    def test_returns_v6_5tuples(self):
+        from shorewall_nft_netkit.validators import snapshot_ct_5tuples
+
+        msgs = [
+            self._make_msg(
+                family=6, src="2a00:f88::1", dst="2a00:f88::2",
+                proto_num=6, sport=11111, dport=443,
+            ),
+        ]
+
+        class _CtSpy:
+            def __init__(self, *_a, **_k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def dump(self):
+                return iter(msgs)
+
+        with patch(_NFCT_PATCH, _CtSpy):
+            tuples = snapshot_ct_5tuples()
+
+        assert (6, "2a00:f88::1", "2a00:f88::2", 11111, 443) in tuples
+
+    def test_empty_on_netns_error(self):
+        """If NFCTSocket raises, return an empty set — never propagate."""
+        from shorewall_nft_netkit.validators import snapshot_ct_5tuples
+
+        class _CtBoom:
+            def __init__(self, *_a, **_k):
+                raise OSError("netns gone")
+
+        with patch(_NFCT_PATCH, _CtBoom):
+            tuples = snapshot_ct_5tuples()
+        assert tuples == set()
